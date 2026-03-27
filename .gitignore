@@ -1,0 +1,38 @@
+# Data (never commit the raw dataset)
+data/raw/
+data/processed/
+*.csv
+
+# Outputs (generated, not versioned)
+outputs/plots/
+outputs/reports/
+outputs/models/
+*.png
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Environments
+.env
+.venv
+venv/
+env/
+
+# Notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store

@@ -11,7 +11,7 @@ Fraud teams cannot review every transaction. A model that outputs a probability 
 
 This project answers: **if analysts can review K transactions per day, what is the optimal policy and how much fraud does it capture?**
 
-The answer is operationalised through a cost-sensitive triage framework that maps model outputs to business decisions, evaluated with metrics that reflect real analyst workflows.
+The answer is operationalised through a cost-sensitive triage framework that maps model outputs to business decisions, evaluated with metrics that reflect real analyst workflows. The trained model is served via a FastAPI REST API, containerised with Docker, returning calibrated fraud probabilities, risk tiers, and per-transaction SHAP explanations.
 
 ---
 
@@ -43,6 +43,11 @@ creditcard.csv
      ▼             ▼              ▼
   SHAP          Triage        Drift
   Explainer     Queue K=500   Monitor
+                   │
+                   ▼
+         FastAPI REST API
+         (Dockerised, /predict
+          /score-batch /health)
 ```
 
 ---
@@ -58,9 +63,9 @@ Random train/test splitting leaks future information into training. A model trai
 At 0.17% fraud rate, a model that classifies everything as legitimate achieves 99.83% accuracy. ROC-AUC is also inflated by the large number of true negatives. **PR-AUC** (Average Precision) is the correct primary metric for severely imbalanced binary classification — it focuses entirely on the positive (fraud) class.
 
 ### 3. Calibrated Probabilities
-Tree models (LightGBM, XGBoost) produce well-ranked scores but poorly calibrated probabilities on imbalanced data. Raw scores from different models are also on incompatible scales, making direct averaging meaningless.
+Tree models (LightGBM, XGBoost) produce well-ranked but poorly calibrated probabilities on imbalanced data. Raw scores from different models are also on incompatible scales, making direct averaging meaningless.
 
-**Isotonic regression calibration** (fitted on the validation set, not training set) aligns predicted P(fraud) with empirical fraud rates. This is validated via reliability diagrams (calibration curves) and Expected Calibration Error (ECE).
+**Isotonic regression calibration** (fitted on the validation set, not training set) aligns predicted P(fraud) with empirical fraud rates. Validated via reliability diagrams (calibration curves) and Expected Calibration Error (ECE).
 
 ### 4. Cost-Sensitive Thresholding
 Instead of picking K=500 arbitrarily, the optimal review capacity is derived from a cost matrix:
@@ -69,23 +74,18 @@ Instead of picking K=500 arbitrarily, the optimal review capacity is derived fro
 
 `optimal_k = argmin_K [ missed_frauds(K) × FN_cost + false_alerts(K) × FP_cost ]`
 
-The cost curve plot visualises this across all K values for all models.
-
 ### 5. SHAP Explainability
 Fraud detection systems that cannot explain individual decisions cannot be deployed under UK FCA guidelines or the EU AI Act. SHAP (TreeExplainer) provides:
 - **Global**: feature importance bar chart + beeswarm plot
-- **Local**: waterfall plots for each flagged transaction ("why was this flagged?")
-
-This bridges the gap between model performance and operational use.
+- **Local**: waterfall plots per flagged transaction ("why was this flagged?")
+- **API**: top-5 SHAP features returned on every `/predict` call
 
 ### 6. Concept Drift Monitoring
-The test set is split into 5 chronological windows. PR-AUC is evaluated per window to simulate weekly performance monitoring. A retraining alert is triggered if PR-AUC drops more than 5% from peak — a basic but production-realistic monitoring trigger.
+The test set is split into 5 chronological windows. PR-AUC is evaluated per window to simulate weekly performance monitoring. A retraining alert fires if PR-AUC drops more than 5% from peak.
 
 ---
 
 ## Feature Engineering
-
-The raw dataset provides V1–V28 (pre-PCA transformed for privacy) plus `Time` and `Amount`. We add:
 
 | Feature | Rationale |
 |---|---|
@@ -93,7 +93,7 @@ The raw dataset provides V1–V28 (pre-PCA transformed for privacy) plus `Time` 
 | `Amount_zscore` | Standardised amount; large z-scores signal unusual transaction sizes |
 | `Hour`, `Hour_sin`, `Hour_cos` | Cyclical time-of-day encoding; fraud peaks overnight |
 | `V14_V17`, `V12_V14`, `V14_sq` | Interaction terms; V14, V12, V17 are top fraud signals in literature |
-| `V_norm_l2` | L2 norm of V-features; measures overall 'unusualness' of the PCA vector |
+| `V_norm_l2` | L2 norm of V-features; measures overall unusualness of the PCA vector |
 
 ---
 
@@ -107,7 +107,7 @@ The raw dataset provides V1–V28 (pre-PCA transformed for privacy) plus `Time` 
 | Validation | 56,961 | 57 | 0.100% |
 | Test | 56,962 | 75 | 0.132% |
 
-> Note: fraud rate drops across time windows — a real-world effect of temporal splitting that random splits would hide.
+> Fraud rate drops across time windows — a real-world effect of temporal splitting that random splits would hide.
 
 ---
 
@@ -135,7 +135,7 @@ The raw dataset provides V1–V28 (pre-PCA transformed for privacy) plus `Time` 
 | XGBoost (calibrated) | 0.971 | 0.746 | 0.000 | 0.853 | 97× |
 | LightGBM (raw) | 0.829 | 0.180 | 0.001 | 0.800 | 91× |
 
-> **Notable finding:** Logistic Regression wins on the test set (PR-AUC 0.801) despite the ensemble dominating validation (PR-AUC 0.989). This is a direct consequence of honest temporal splitting — the calibrated tree models overfit to validation-era patterns. This is exactly the kind of finding that matters in production and would be invisible with random splits.
+> **Notable finding:** Logistic Regression wins on the test set (PR-AUC 0.801) despite the ensemble dominating validation (PR-AUC 0.989). A direct consequence of honest temporal splitting — the calibrated tree models overfit to validation-era patterns. This finding is invisible with random splits.
 
 ---
 
@@ -166,37 +166,77 @@ Cost-optimal K:      250       (£8,890 expected cost)
 | W3 | 160,279 – 165,582 | 11,392 | 8 | 0.753 | ⚠️ Yes |
 | W4 | 165,582 – 172,792 | 11,394 | 10 | 0.582 | ⚠️ Yes |
 
-> PR-AUC degrades from **0.849 → 0.582** (31% drop) across the test period. Retraining alerts fire in the final 3 windows. This demonstrates why static model deployment without monitoring is risky — and why this system includes drift detection.
+> PR-AUC degrades from **0.849 → 0.582** (31% drop). Retraining alerts fire in the final 3 windows.
 
 ---
 
-## Repo Structure
+## Deployment
 
+### Local API (no Docker)
+
+```bash
+# 1. Train and save models
+python main.py
+
+# 2. Start the server
+uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload
+
+# 3. Interactive docs
+open http://localhost:8000/docs
 ```
-fraud-triage-engine/
-├── src/
-│   ├── data.py           # Temporal splitting + feature engineering
-│   ├── train.py          # LR / LightGBM / XGBoost + calibration + ensemble
-│   ├── evaluate.py       # ROC-AUC, PR-AUC, Precision@K, Recall@K, ECE, cost
-│   ├── explainability.py # SHAP global + local explanations
-│   ├── drift.py          # Concept drift simulation + retraining alerts
-│   └── viz.py            # All plots (capture curve, PR, calibration, drift, cost)
-├── notebooks/
-│   └── fraud_triage_walkthrough.ipynb   # End-to-end narrative notebook
-├── tests/
-│   ├── test_data.py      # Temporal split correctness, feature engineering
-│   └── test_evaluate.py  # Triage metrics, ECE, evaluate()
-├── outputs/
-│   ├── plots/            # All generated figures
-│   ├── reports/          # CSVs, model comparison, triage queue, summary.json
-│   └── models/           # Serialised model artefacts
-├── data/
-│   └── raw/              # creditcard.csv goes here (not committed to git)
-├── docs/
-│   └── methodology.md    # Deep-dive on design decisions
-├── main.py               # Full pipeline orchestration
-├── requirements.txt
-└── README.md
+
+### Docker
+
+```bash
+# Build
+docker build -t fraud-triage-api .
+
+# Run — mount models directory so API loads trained weights
+docker run -p 8000:8000 \
+  -v $(pwd)/models:/app/models \
+  -v $(pwd)/outputs:/app/outputs \
+  fraud-triage-api
+
+# Health check
+curl http://localhost:8000/health
+# → {"status":"ok","model_loaded":true,"error":null}
+```
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/health` | Liveness check — returns 200 even if model not loaded |
+| GET | `/model-info` | Training summary metrics from last `main.py` run |
+| POST | `/predict` | Score one transaction → `fraud_prob`, `risk_tier`, top-5 SHAP |
+| POST | `/score-batch` | Score up to 1,000 transactions → ranked analyst queue |
+
+### Example: single prediction
+
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"Time": 406.0, "Amount": 149.62, "V1": -1.36, "V2": -0.07, "V3": 2.54,
+       "V4": 1.38, "V5": -0.34, "V6": 0.46, "V7": 0.24, "V8": 0.10,
+       "V9": 0.36, "V10": 0.09, "V11": -0.55, "V12": -0.62, "V13": -0.99,
+       "V14": -0.31, "V15": 1.47, "V16": -0.47, "V17": 0.21, "V18": 0.03,
+       "V19": 0.40, "V20": 0.25, "V21": -0.02, "V22": 0.28, "V23": -0.11,
+       "V24": 0.07, "V25": 0.13, "V26": -0.19, "V27": 0.13, "V28": -0.02}'
+```
+
+```json
+{
+  "fraud_prob": 0.847312,
+  "risk_tier": "CRITICAL",
+  "top_shap": [
+    {"feature": "V14", "shap_value": -0.312, "direction": "increases_fraud"},
+    {"feature": "V4",  "shap_value":  0.198, "direction": "decreases_fraud"},
+    {"feature": "V12", "shap_value": -0.187, "direction": "increases_fraud"},
+    {"feature": "Amount_log1p", "shap_value": 0.091, "direction": "decreases_fraud"},
+    {"feature": "V17", "shap_value": -0.073, "direction": "increases_fraud"}
+  ],
+  "latency_ms": 4.2
+}
 ```
 
 ---
@@ -205,23 +245,59 @@ fraud-triage-engine/
 
 ```bash
 # 1. Install dependencies
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
 
-# 2. Place dataset
-# Download from: https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud
-# Place at: data/raw/creditcard.csv
+# 2. Download dataset and place at data/raw/creditcard.csv
+# https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud
 
-# 3. Run full pipeline
+# 3. Run full pipeline (trains, evaluates, saves models)
 python main.py
 
 # 4. Custom cost structure or capacity
 python main.py --policy-k 750 --fn-cost 800 --fp-cost 15
 
-# 5. Skip SHAP (faster iteration)
+# 5. Skip SHAP for faster iteration
 python main.py --skip-shap
 
 # 6. Run tests
-python -m pytest tests/ -v
+pytest tests/ -v
+```
+
+---
+
+## Repo Structure
+
+```
+fraud-triage-engine/
+├── api/
+│   └── app.py                       # FastAPI — /predict, /score-batch, /health
+├── src/
+│   ├── data.py                      # Temporal split + feature engineering
+│   ├── train.py                     # LR / LightGBM / XGBoost + calibration + ensemble
+│   ├── evaluate.py                  # ROC-AUC, PR-AUC, Precision@K, ECE, cost
+│   ├── explainability.py            # SHAP global + local explanations
+│   ├── drift.py                     # Concept drift simulation + retraining alerts
+│   └── viz.py                       # All plots
+├── tests/
+│   ├── test_data.py                 # Temporal split correctness, feature engineering
+│   └── test_evaluate.py             # Triage metrics, ECE, evaluate()
+├── models/                          # Saved after main.py — gitignored
+│   ├── lgbm_cal.pkl
+│   ├── xgb_cal.pkl
+│   └── feature_names.json
+├── notebooks/
+│   └── fraud_triage_walkthrough.ipynb
+├── outputs/
+│   ├── plots/
+│   └── reports/
+├── data/
+│   └── raw/                         # creditcard.csv — not committed
+├── docs/
+│   └── methodology.md
+├── Dockerfile
+├── main.py
+├── requirements.txt
+└── README.md
 ```
 
 ---
@@ -260,12 +336,11 @@ python -m pytest tests/ -v
 
 - **Hyperparameter optimisation**: Optuna TPE search with PR-AUC objective
 - **Isolation Forest / Autoencoder**: Unsupervised anomaly detection as an additional signal
-- **Streaming simulation**: Simulate daily batch retraining and score fresh transactions
-- **FastAPI serving**: REST endpoint returning `{fraud_prob, risk_tier, top_shap_features}`
+- **Streaming simulation**: Simulate daily batch retraining on fresh transactions
 - **MLflow tracking**: Log all experiments, metrics, and model artefacts with run comparison
 
 ---
 
 ## Tech Stack
 
-`Python 3.14` · `LightGBM 4.3` · `XGBoost 2.0` · `scikit-learn 1.6` · `SHAP 0.45` · `pandas 2.2` · `matplotlib 3.8`
+`Python 3.11` · `LightGBM 4.3` · `XGBoost 2.0` · `scikit-learn 1.6` · `SHAP 0.45` · `pandas 2.2` · `NumPy` · `matplotlib 3.8` · `FastAPI` · `uvicorn` · `Docker` · `joblib` · `pytest`

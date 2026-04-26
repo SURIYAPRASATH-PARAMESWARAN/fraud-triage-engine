@@ -6,12 +6,13 @@ Execution order:
   2. Feature engineering
   3. Train all models (LR baseline, LightGBM, XGBoost)
   4. Calibrate LightGBM and XGBoost
-  5. Build rank ensemble
-  6. Evaluate all models (ROC-AUC, PR-AUC, Precision@K, Recall@K, ECE, Cost)
-  7. SHAP explainability on best model
-  8. Concept drift simulation
-  9. Save all outputs + final triage queue
- 10. Print comparison table
+  5. Save models to disk (for API serving)
+  6. Build rank ensemble
+  7. Evaluate all models (ROC-AUC, PR-AUC, Precision@K, Recall@K, ECE, Cost)
+  8. SHAP explainability on best model
+  9. Concept drift simulation
+ 10. Save all outputs + final triage queue
+ 11. Print comparison table
 
 Usage:
     python main.py --data data/raw/creditcard.csv --policy-k 500
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import joblib
 import sys
 import time
 from pathlib import Path
@@ -64,16 +66,17 @@ from src.viz import (
     plot_cost_curve,
 )
 
-OUTPUTS = Path("outputs")
+OUTPUTS    = Path("outputs")
+MODELS_DIR = Path("models")
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Fraud Triage Engine")
-    p.add_argument("--data",     default="data/raw/creditcard.csv", help="Path to creditcard.csv")
-    p.add_argument("--policy-k", type=int, default=500,             help="Analyst review capacity")
-    p.add_argument("--fn-cost",  type=float, default=500.0,         help="£ cost of missed fraud")
-    p.add_argument("--fp-cost",  type=float, default=10.0,          help="£ cost of false alert")
-    p.add_argument("--skip-shap", action="store_true",              help="Skip SHAP (faster runs)")
+    p.add_argument("--data",      default="data/raw/creditcard.csv", help="Path to creditcard.csv")
+    p.add_argument("--policy-k",  type=int,   default=500,           help="Analyst review capacity")
+    p.add_argument("--fn-cost",   type=float, default=500.0,         help="£ cost of missed fraud")
+    p.add_argument("--fp-cost",   type=float, default=10.0,          help="£ cost of false alert")
+    p.add_argument("--skip-shap", action="store_true",               help="Skip SHAP (faster runs)")
     return p.parse_args()
 
 
@@ -87,10 +90,12 @@ def main():
     args = parse_args()
     t0 = time.time()
 
-    # ── Create output directories (safe on all platforms) ─────────────────
+    # ── Create output directories ──────────────────────────────────────────────
     for _d in ["outputs/reports", "outputs/plots", "outputs/models",
                "outputs/plots/shap_waterfalls"]:
         Path(_d).mkdir(parents=True, exist_ok=True)
+
+    MODELS_DIR.mkdir(exist_ok=True)
 
     # ── 1. Load + Split ────────────────────────────────────────────────────────
     banner("1. Loading Data")
@@ -135,14 +140,30 @@ def main():
     xgbm_cal = calibrate_model(xgbm, splits.X_val, splits.y_val, method="isotonic")
     print("  Calibrated: LightGBM, XGBoost")
 
-    # ── 4. Score All Sets ──────────────────────────────────────────────────────
+    # ── 4. Save Models to Disk (required for API serving) ─────────────────────
+    banner("5b. Saving Models")
+    joblib.dump(lgbm_cal.model, MODELS_DIR / "lgbm_cal.pkl")
+    print(f"  Saved: {MODELS_DIR / 'lgbm_cal.pkl'}")
+
+    joblib.dump(xgbm_cal.model, MODELS_DIR / "xgb_cal.pkl")
+    print(f"  Saved: {MODELS_DIR / 'xgb_cal.pkl'}")
+
+    # Save feature list so the API knows what columns to expect
+    feature_list = splits.X_train.columns.tolist()
+    (MODELS_DIR / "feature_names.json").write_text(
+        json.dumps(feature_list, indent=2), encoding="utf-8"
+    )
+    print(f"  Saved: {MODELS_DIR / 'feature_names.json'}")
+    print(f"  Models ready for API serving.")
+
+    # ── 5. Score All Sets ──────────────────────────────────────────────────────
     banner("6. Scoring")
     models = {
-        "logreg_baseline":   lr,
-        "lightgbm":          lgbm,
-        "lightgbm_cal":      lgbm_cal,
-        "xgboost":           xgbm,
-        "xgboost_cal":       xgbm_cal,
+        "logreg_baseline": lr,
+        "lightgbm":        lgbm,
+        "lightgbm_cal":    lgbm_cal,
+        "xgboost":         xgbm,
+        "xgboost_cal":     xgbm_cal,
     }
 
     val_scores, test_scores = {}, {}
@@ -157,7 +178,7 @@ def main():
     print(f"  Scored: ensemble_cal")
     print(f"  Total models scored: {len(val_scores)} — val and test sets")
 
-    # ── 5. Evaluate ────────────────────────────────────────────────────────────
+    # ── 6. Evaluate ────────────────────────────────────────────────────────────
     banner("7. Evaluation")
     ks = (100, 250, 500, 750, 1000, 2000)
 
@@ -179,12 +200,12 @@ def main():
     val_comp.to_csv(OUTPUTS / "reports" / "model_comparison_val.csv",  index=False)
     test_comp.to_csv(OUTPUTS / "reports" / "model_comparison_test.csv", index=False)
 
-    # ── 6. Select Best Model for Policy ───────────────────────────────────────
+    # ── 7. Select Best Model for Policy ───────────────────────────────────────
     # Best = highest PR-AUC on validation (NOT test — test is locked until the end)
     best_name = val_comp.iloc[0]["model"]
     print(f"\n  Best model (by val PR-AUC): {best_name}")
 
-    # ── 7. Save Triage Queue (locked test policy) ──────────────────────────────
+    # ── 8. Save Triage Queue (locked test policy) ──────────────────────────────
     banner(f"8. Triage Queue — Top-{args.policy_k} (Test Set, Locked Policy)")
     triage_df = save_triage_queue(
         X=splits.X_test,
@@ -207,18 +228,14 @@ def main():
     ok, om = optimal_k_by_cost(best_test)
     print(f"\n  Cost-optimal K: {ok}  (expected cost £{om.expected_cost:,.0f})")
 
-    # ── 8. SHAP ────────────────────────────────────────────────────────────────
+    # ── 9. SHAP ────────────────────────────────────────────────────────────────
     if not args.skip_shap:
         banner("9. SHAP Explainability")
 
-        # SHAP requires a single tree model — ensemble_cal is a blend so we
-        # always use lightgbm_cal for explanation (best single calibrated tree).
-        # Fall back to lightgbm (uncalibrated) if calibrated version unavailable.
         shap_model_name = "lightgbm_cal" if "lightgbm_cal" in models else "lightgbm"
         shap_model_obj  = models[shap_model_name]
         print(f"  Using {shap_model_name} for SHAP (single tree model required)")
 
-        # Unwrap CalibratedClassifierCV to get the raw LightGBM estimator
         raw_model = shap_model_obj.model
         if hasattr(raw_model, "calibrated_classifiers_"):
             raw_model = raw_model.calibrated_classifiers_[0].estimator
@@ -245,7 +262,7 @@ def main():
     else:
         print("  (SHAP skipped via --skip-shap flag)")
 
-    # ── 9. Drift Simulation ────────────────────────────────────────────────────
+    # ── 10. Drift Simulation ───────────────────────────────────────────────────
     banner("10. Concept Drift Simulation (Test Set Windows)")
     drift_windows = simulate_drift(
         splits.X_test, splits.y_test, test_scores[best_name],
@@ -255,7 +272,7 @@ def main():
     print(drift_df.to_string(index=False))
     drift_df.to_csv(OUTPUTS / "reports" / "drift_simulation.csv", index=False)
 
-    # ── 10. Plots ──────────────────────────────────────────────────────────────
+    # ── 11. Plots ──────────────────────────────────────────────────────────────
     banner("11. Generating Plots")
 
     score_sets_val  = {n: (splits.y_val,  val_scores[n])  for n in val_scores}
@@ -269,23 +286,15 @@ def main():
         score_sets_test, OUTPUTS / "plots" / "fraud_capture_curve_test.png",
         policy_k=args.policy_k, title="Fraud Capture Curve (Test — Locked)"
     )
-    plot_pr_curves(score_sets_val, OUTPUTS / "plots" / "pr_curves_val.png")
+    plot_pr_curves(score_sets_val,  OUTPUTS / "plots" / "pr_curves_val.png")
     plot_pr_curves(score_sets_test, OUTPUTS / "plots" / "pr_curves_test.png",
                    title="Precision-Recall Curves (Test — Locked)")
 
-    # Calibration plots
     cal_data = {r.model_name: r.calibration_data for r in val_reports}
     plot_calibration_curves(cal_data, OUTPUTS / "plots" / "calibration_curves.png")
 
-    # Model comparison
-    comp_plot_cols = {"roc_auc", "pr_auc", "recall@500", "precision@500"}
-    plot_comp_df = test_comp.rename(columns={"recall@500": "recall@500", "precision@500": "precision@500"})
     plot_model_comparison(test_comp, OUTPUTS / "plots" / "model_comparison.png")
-
-    # Drift
-    plot_drift_curve(drift_df, OUTPUTS / "plots" / "drift_curve.png")
-
-    # Cost curve
+    plot_drift_curve(drift_df,       OUTPUTS / "plots" / "drift_curve.png")
     plot_cost_curve(
         score_sets_test, OUTPUTS / "plots" / "cost_curve.png",
         fn_cost=args.fn_cost, fp_cost=args.fp_cost, policy_k=args.policy_k,
@@ -293,28 +302,28 @@ def main():
 
     print("  All plots saved to outputs/plots/")
 
-    # ── 11. Final Summary ──────────────────────────────────────────────────────
+    # ── 12. Final Summary ──────────────────────────────────────────────────────
     banner("DONE")
     elapsed = time.time() - t0
     print(f"  Total runtime: {elapsed:.1f}s")
-    print(f"  Best model: {best_name}")
-    print(f"  Val PR-AUC: {val_comp.iloc[0]['pr_auc']}")
+    print(f"  Best model:    {best_name}")
+    print(f"  Val PR-AUC:    {val_comp.iloc[0]['pr_auc']}")
     print(f"  Test Recall@{args.policy_k}: {tm.recall:.4f}")
-    print(f"  Outputs: {OUTPUTS.resolve()}")
+    print(f"  Outputs:       {OUTPUTS.resolve()}")
+    print(f"  Models saved:  {MODELS_DIR.resolve()}")
 
-    # Machine-readable summary for CI / MLflow
     summary = {
-        "best_model": best_name,
-        "val_pr_auc":         float(val_comp.iloc[0]["pr_auc"]),
-        "test_roc_auc":       float(test_comp[test_comp["model"] == best_name]["roc_auc"].iloc[0]),
-        "test_pr_auc":        float(test_comp[test_comp["model"] == best_name]["pr_auc"].iloc[0]),
+        "best_model":     best_name,
+        "val_pr_auc":     float(val_comp.iloc[0]["pr_auc"]),
+        "test_roc_auc":   float(test_comp[test_comp["model"] == best_name]["roc_auc"].iloc[0]),
+        "test_pr_auc":    float(test_comp[test_comp["model"] == best_name]["pr_auc"].iloc[0]),
         f"test_recall@{args.policy_k}":    round(tm.recall, 4),
         f"test_precision@{args.policy_k}": round(tm.precision, 4),
-        "frauds_caught":      tm.frauds_caught,
-        "frauds_missed":      tm.frauds_missed,
-        "expected_cost_gbp":  round(tm.expected_cost, 0),
-        "optimal_k":          ok,
-        "runtime_s":          round(elapsed, 1),
+        "frauds_caught":     tm.frauds_caught,
+        "frauds_missed":     tm.frauds_missed,
+        "expected_cost_gbp": round(tm.expected_cost, 0),
+        "optimal_k":         ok,
+        "runtime_s":         round(elapsed, 1),
     }
     (OUTPUTS / "reports" / "summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
